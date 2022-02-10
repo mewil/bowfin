@@ -174,12 +174,12 @@ func uploadPart(s3Client *s3.S3, upload *s3.CreateMultipartUploadOutput, data []
 		ContentLength: aws.Int64(int64(len(data))),
 	})
 	if err != nil {
-		if _, err = s3Client.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
+		if _, err2 := s3Client.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
 			Bucket:   upload.Bucket,
 			Key:      upload.Key,
 			UploadId: upload.UploadId,
-		}); err != nil {
-			return nil, err
+		}); err2 != nil {
+			return nil, fmt.Errorf("failed to abort multipart upload while handing err '%v': %w", err, err2)
 		}
 		return nil, fmt.Errorf("failed to upload part %d: %s", part, err)
 	}
