@@ -1,7 +1,7 @@
-FROM golang:1.17-alpine AS build
+FROM golang:1.18-alpine AS build
 ENV CGO_ENABLED=0
-COPY . /go/src/github.com/mewil/bowfin
-WORKDIR /go/src/github.com/mewil/bowfin
+WORKDIR /home
+COPY . .
 RUN go mod download
 RUN go install .
 RUN adduser -D -g '' user
