@@ -81,20 +81,21 @@ func main() {
 	go upload(documents, done, s3Client, multipartUpload)
 
 	docCount := 0
-	scroll(es, func(key, value gjson.Result) bool {
+	if err = scroll(es, func(key, value gjson.Result) bool {
 		documents <- []byte(value.String())
 		docCount++
 		return true
-	})
-	<-done
+	}); err != nil {
+		log.Fatal(err)
+	}
 	close(documents)
+	<-done
 	log.Println("successfully uploaded", docCount, "documents to key", key)
 }
 
 func upload(documents <-chan []byte, done chan<- struct{}, s3Client *s3.S3, multipartUpload *s3.CreateMultipartUploadOutput) {
 	uploadedParts := make(chan *s3.CompletedPart)
 	completedParts := make([]*s3.CompletedPart, 0)
-	part := 1
 	s := semaphore.NewWeighted(int64(Config.ConcurrentUploads))
 	wg := &sync.WaitGroup{}
 	go func() {
@@ -104,13 +105,10 @@ func upload(documents <-chan []byte, done chan<- struct{}, s3Client *s3.S3, mult
 			wg.Done()
 		}
 	}()
-	for {
-		batch := batchDocuments(documents)
-		if batch == nil {
+	for part := 1; ; part++ {
+		batch, ok := batchDocuments(documents)
+		if !ok && len(batch) == 0 {
 			break
-		}
-		if len(batch) == 0 {
-			continue
 		}
 		_ = s.Acquire(context.Background(), 1)
 		wg.Add(1)
@@ -125,9 +123,9 @@ func upload(documents <-chan []byte, done chan<- struct{}, s3Client *s3.S3, mult
 				PartNumber: aws.Int64(int64(p)),
 			}
 		}(batch, part)
-		part++
 	}
 	wg.Wait()
+	close(uploadedParts)
 	if _, err := s3Client.CompleteMultipartUpload(&s3.CompleteMultipartUploadInput{
 		Bucket:   multipartUpload.Bucket,
 		Key:      multipartUpload.Key,
@@ -141,27 +139,20 @@ func upload(documents <-chan []byte, done chan<- struct{}, s3Client *s3.S3, mult
 	done <- struct{}{}
 }
 
-func batchDocuments(documents <-chan []byte) []byte {
+func batchDocuments(documents <-chan []byte) ([]byte, bool) {
 	buf := bytes.NewBuffer(nil)
-	for {
-		select {
-		case doc, ok := <-documents:
-			if !ok {
-				return nil
-			}
-			if _, err := buf.Write(doc); err != nil {
-				log.Fatal("failed to write document to buffer:", err)
-			}
-			if _, err := buf.WriteRune('\n'); err != nil {
-				log.Fatal("failed to write newline to buffer:", err)
-			}
-			if buf.Len() >= fiveMBInBytes {
-				return buf.Bytes()
-			}
-		case <-time.After(5 * time.Second):
-			return buf.Bytes()
+	for doc := range documents {
+		if _, err := buf.Write(doc); err != nil {
+			log.Fatal("failed to write document to buffer:", err)
+		}
+		if _, err := buf.WriteRune('\n'); err != nil {
+			log.Fatal("failed to write newline to buffer:", err)
+		}
+		if buf.Len() >= fiveMBInBytes {
+			return buf.Bytes(), true
 		}
 	}
+	return buf.Bytes(), false
 }
 
 func uploadPart(s3Client *s3.S3, upload *s3.CreateMultipartUploadOutput, data []byte, part int) (*string, error) {
@@ -174,26 +165,26 @@ func uploadPart(s3Client *s3.S3, upload *s3.CreateMultipartUploadOutput, data []
 		ContentLength: aws.Int64(int64(len(data))),
 	})
 	if err != nil {
-		if _, err2 := s3Client.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
+		if _, abortErr := s3Client.AbortMultipartUpload(&s3.AbortMultipartUploadInput{
 			Bucket:   upload.Bucket,
 			Key:      upload.Key,
 			UploadId: upload.UploadId,
-		}); err2 != nil {
-			return nil, fmt.Errorf("failed to abort multipart upload while handing err '%v': %w", err, err2)
+		}); abortErr != nil {
+			return nil, fmt.Errorf("failed to abort multipart upload while handing err '%v': %w", err, abortErr)
 		}
-		return nil, fmt.Errorf("failed to upload part %d: %s", part, err)
+		return nil, fmt.Errorf("failed to upload part %d: %w", part, err)
 	}
 	return res.ETag, nil
 }
 
-func scroll(es *elasticsearch.Client, hitCallback func(key, value gjson.Result) bool) {
+func scroll(es *elasticsearch.Client, hitCallback func(key, value gjson.Result) bool) error {
 	data, err := doEsRequest(es.Search(
 		es.Search.WithIndex(Config.EsIndex),
 		es.Search.WithSize(Config.ScrollSize),
 		es.Search.WithScroll(Config.EsScrollTime),
 	))
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	hits := gjson.GetBytes(data, "hits.hits")
 	hits.ForEach(hitCallback)
@@ -204,15 +195,17 @@ func scroll(es *elasticsearch.Client, hitCallback func(key, value gjson.Result) 
 			es.Scroll.WithScrollID(scrollID),
 		))
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		hits = gjson.GetBytes(data, "hits.hits")
 		if len(hits.Array()) == 0 {
+			log.Println("no more document hits")
 			break
 		}
 		hits.ForEach(hitCallback)
 		scrollID = gjson.GetBytes(data, "_scroll_id").String()
 	}
+	return nil
 }
 
 func doEsRequest(res *esapi.Response, err error) ([]byte, error) {
